@@ -1,0 +1,130 @@
+// RateGuard-DC wire contract. Every process talks to the others through these
+// gRPC services (Exp 1: unary RPC, Exp 2: server / client / bidirectional streaming).
+syntax = "proto3";
+
+package rateguard;
+
+option java_package = "com.rateguard.dc.proto";
+option java_multiple_files = true;
+
+message Empty {}
+
+// One rate-limit level (tenant, API key or client IP).
+message Limit {
+  double cap = 1;           // burst capacity (tokens)
+  double rate = 2;          // refill tokens per second
+  int64 window_ms = 3;      // sliding-window length, 0 = off
+  int64 window_limit = 4;   // max requests per window, 0 = off
+}
+
+// Cluster-wide policy, pushed by the leader to every edge over the Control stream.
+message Policy {
+  Limit tenant = 1;
+  Limit key = 2;
+  Limit ip = 3;
+  bool ip_local = 4;            // IP level enforced per node (no coordinator traffic)
+  string consistency = 5;       // "bounded" | "strong" | "eventual"   (Exp 8)
+  string outage_mode = 6;       // "local" | "ra" | "token" | "pool"    (Exp 4, 5, 6)
+  bool lock_ordering = 7;       // pool mode: acquire locks in a global order (deadlock-free)
+  int64 version = 8;
+}
+
+// ---------------------------------------------------------------- TokenStore
+// Served by the coordinator leader; followers answer not_leader + leader address.
+service TokenStore {
+  rpc Lease(LeaseRequest) returns (LeaseReply);                    // Exp 1 unary: reserve a batch of tokens
+  rpc Give(GiveRequest) returns (GiveReply);                       // Exp 1 unary: return unused tokens
+  rpc Acquire(AcquireRequest) returns (AcquireReply);              // Exp 8 strong consistency: one token at all 3 levels, atomically
+  rpc Peek(PeekRequest) returns (PeekReply);                       // Exp 8 eventual consistency: read global tokens
+  rpc WhoIsLeader(Empty) returns (LeaderInfo);                     // Exp 1 unary: leader discovery
+  rpc SetPolicy(Policy) returns (Policy);                          // console -> leader
+  rpc Status(Empty) returns (CoordStatus);                         // console -> any coordinator
+  rpc ReportUsage(stream UsageReport) returns (UsageAck);          // Exp 2 client streaming: batched usage from an edge
+  rpc Control(stream EdgeHello) returns (stream ControlMsg);       // Exp 2 bidirectional: heartbeats up, policy + membership down
+}
+
+message LeaseRequest { string key = 1; Limit limit = 2; int64 want = 3; string node = 4; }
+message LeaseReply { int64 granted = 1; bool not_leader = 2; LeaderInfo leader = 3; }
+message GiveRequest { string key = 1; Limit limit = 2; int64 tokens = 3; }
+message GiveReply { bool ok = 1; bool not_leader = 2; }
+message AcquireRequest { repeated string keys = 1; repeated Limit limits = 2; }
+message AcquireReply { bool allowed = 1; int32 denied_level = 2; bool not_leader = 3; }
+message PeekRequest { string key = 1; Limit limit = 2; int64 consume = 3; }
+message PeekReply { double tokens = 1; bool not_leader = 2; }
+message LeaderInfo { int32 leader_id = 1; string leader_addr = 2; int64 term = 3; }
+
+message UsageReport { string node = 1; string key = 2; Limit limit = 3; int64 returned = 4; int64 debt = 5; }
+message UsageAck { int64 reports = 1; int64 returned = 2; int64 debt = 3; }
+
+message EdgeHello { string node = 1; string peer_addr = 2; int64 allowed = 3; int64 denied = 4; }
+message ControlMsg { Policy policy = 1; repeated string members = 2; LeaderInfo leader = 3; }
+
+message CoordStatus {
+  int32 id = 1; bool leader = 2; int32 leader_id = 3; int64 term = 4;
+  int64 buckets = 5; int64 leases = 6; int64 gives = 7; int64 acquires = 8;
+  int64 elections = 9; int64 replicated = 10; int32 edges = 11; Policy policy = 12;
+  int64 usage_reports = 13; int64 control_msgs = 14;
+}
+
+// ---------------------------------------------------------------- Replication (coordinator <-> coordinator)
+service Replication {
+  rpc Election(ElectionMsg) returns (ElectionReply);          // Exp 9 Bully: "I want to be leader"
+  rpc Coordinator(ElectionMsg) returns (Empty);               // Exp 9 Bully: "I am the leader"
+  rpc Heartbeat(ElectionMsg) returns (ElectionReply);         // follower -> leader liveness
+  rpc Replicate(ElectionMsg) returns (stream BucketUpdate);   // Exp 2 server streaming: leader -> follower state log
+}
+
+message ElectionMsg { int32 from = 1; int64 term = 2; string addr = 3; }
+message ElectionReply { bool ok = 1; int32 leader_id = 2; int64 term = 3; }
+message BucketUpdate {
+  string key = 1; double tokens = 2; int64 ts = 3;
+  int64 wstart = 4; int64 wcur = 5; int64 wprev = 6;
+  Policy policy = 7;   // set when the policy changes
+}
+
+// ---------------------------------------------------------------- Peer (edge <-> edge, used while no leader exists)
+service Peer {
+  rpc Deliver(PeerMsg) returns (Empty);                       // one-way message, counted for overhead
+  rpc WatchStats(Empty) returns (stream EdgeStats);           // Exp 2 server streaming: live stats to the console
+}
+
+message SharedBucket { double tokens = 1; int64 ts = 2; int64 version = 3; }
+
+message PeerMsg {
+  string from = 1;
+  string resource = 2;
+  oneof body {
+    RaRequest ra_request = 3;     // Exp 4 Ricart-Agrawala
+    RaReply ra_reply = 4;
+    SkRequest sk_request = 5;     // Exp 5 Suzuki-Kasami
+    SkToken sk_token = 6;
+    LockRequest lock_request = 7; // Exp 6 resource locks (pool mode)
+    LockGrant lock_grant = 8;
+    LockRelease lock_release = 9;
+    CmhProbe probe = 10;          // Exp 6 Chandy-Misra-Haas edge-chasing probe
+    LockAbort lock_abort = 11;
+    LockQueued lock_queued = 12;  // home node -> requester: you wait behind this holder
+  }
+}
+message RaRequest { int64 clock = 1; }
+message RaReply { SharedBucket bucket = 1; }
+message SkRequest { int64 seq = 1; }
+message SkToken { repeated int64 ln = 1; repeated string queue = 2; SharedBucket bucket = 3; repeated string order = 4; }
+message LockRequest { int64 txn = 1; int64 started = 2; }
+message LockGrant { SharedBucket bucket = 1; int64 txn = 2; }
+message LockRelease { SharedBucket bucket = 1; int64 txn = 2; }
+message LockAbort { int64 txn = 1; }
+message LockQueued { string holder = 1; int64 holder_txn = 2; }
+message CmhProbe { string initiator = 1; int64 initiator_txn = 2; repeated string path = 3; repeated int64 started = 4; }
+
+message EdgeStats {
+  string node = 1; string mode = 2;
+  int64 allowed = 3; int64 denied = 4; int64 unauthorized = 5;
+  int64 denied_tenant = 6; int64 denied_key = 7; int64 denied_ip = 8;
+  int64 rpc_calls = 9; int64 fallback_events = 10; int64 reconciled = 11;
+  int64 buckets = 12; int64 tokens_returned = 13;
+  int64 mutex_msgs = 14; int64 cs_entries = 15;
+  int64 probes = 16; int64 deadlocks = 17; int64 aborts = 18;
+  string leader = 19; string consistency = 20; string outage_mode = 21;
+  int64 slow_ms = 22; int32 peers = 23;
+}
