@@ -7,6 +7,8 @@ import com.rateguard.dc.proto.*;
 import io.grpc.*;
 import io.grpc.stub.StreamObserver;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -35,17 +37,24 @@ public final class CoordNode {
             replicated = new AtomicLong(), usageReports = new AtomicLong(), controlMsgs = new AtomicLong();
     private volatile StreamObserver<BucketUpdate> replicaStream; // follower side
     private volatile int replicatingFrom;
+    private volatile long leaderSince;
     private Server server;
 
     record Member(String name, String peerAddr, long lastSeen) {}
 
+    /** Durable copy of the policy, so a restarted replica (or the whole ensemble) keeps the operator's limits. */
+    private final Path policyFile;
+
     public CoordNode(int id) {
         this.id = id;
+        this.policyFile = Path.of("data", "coord-" + id + ".policy");
+        loadPolicy();
         this.election = new BullyElection(id, Ports.COORDS, new GrpcTransport());
         store.onChange(u -> { if (election.isLeader() && !followers.isEmpty()) replQueue.offer(u); });
         election.onLeaderChange(l -> {
             Log.info("leader is now %s", l == 0 ? "unknown" : "coord-" + l);
-            if (l == id) pushControl();
+            if (l == id) { leaderSince = System.currentTimeMillis(); adoptNewestPolicy(); pushControl(); }
+            else closeControls();                                    // demoted: edges must reconnect to the new leader
         });
     }
 
@@ -117,7 +126,7 @@ public final class CoordNode {
         replicatingFrom = leaderId;
         StreamObserver<BucketUpdate> obs = new StreamObserver<>() {
             public void onNext(BucketUpdate u) {
-                if (u.hasPolicy()) policy.set(u.getPolicy());
+                if (u.hasPolicy()) installPolicy(u.getPolicy());
                 else store.apply(u);
                 replicated.incrementAndGet();
             }
@@ -129,10 +138,48 @@ public final class CoordNode {
         Log.info("replicating from coord-%d", leaderId);
     }
 
+    // ------------------------------------------------------------ policy durability
+    private void loadPolicy() {
+        try {
+            if (Files.exists(policyFile)) {
+                policy.set(Policy.parseFrom(Files.readAllBytes(policyFile)));
+                Log.info("loaded policy v%d from %s", policy.get().getVersion(), policyFile);
+            }
+        } catch (Exception e) { Log.info("could not read %s: %s", policyFile, e); }
+    }
+
+    /** Installs p if it is newer than the current policy and writes it to disk. */
+    private boolean installPolicy(Policy p) {
+        Policy cur = policy.get();
+        if (p.getVersion() < cur.getVersion()) return false;
+        policy.set(p);
+        try {
+            Files.createDirectories(policyFile.getParent());
+            Path tmp = policyFile.resolveSibling(policyFile.getFileName() + ".tmp");
+            Files.write(tmp, p.toByteArray());
+            Files.move(tmp, policyFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (Exception e) { Log.info("could not write %s: %s", policyFile, e); }
+        return true;
+    }
+
+    /** New leader: a replica that was down during a policy change may be behind, so take the highest version any live peer holds. */
+    private void adoptNewestPolicy() {
+        for (int peer = 1; peer <= Ports.COORDS; peer++) {
+            if (peer == id) continue;
+            try {
+                Policy p = TokenStoreGrpc.newBlockingStub(channel(peer)).withDeadlineAfter(300, TimeUnit.MILLISECONDS)
+                        .status(Empty.getDefaultInstance()).getPolicy();
+                if (p.getVersion() > policy.get().getVersion() && installPolicy(p)) Log.info("adopted policy v%d from coord-%d", p.getVersion(), peer);
+            } catch (StatusRuntimeException ignored) {}
+        }
+    }
+
     // ------------------------------------------------------------ leader -> edges (bidirectional Control stream)
     private ControlMsg controlMsg() {
         List<String> names = new ArrayList<>();
-        members.values().forEach(m -> names.add(m.name() + "@" + m.peerAddr()));
+        // a new leader learns the edges from their heartbeats (one a second); until every edge has had
+        // time to say hello it sends no list, so edges keep their old view instead of a partial one
+        if (System.currentTimeMillis() - leaderSince > 2500) members.values().forEach(m -> names.add(m.name() + "@" + m.peerAddr()));
         names.sort(null);
         return ControlMsg.newBuilder().setPolicy(policy.get()).addAllMembers(names).setLeader(leaderInfo()).build();
     }
@@ -146,10 +193,17 @@ public final class CoordNode {
         }
     }
 
+    private void closeControls() {
+        for (StreamObserver<ControlMsg> c : controls) {
+            try { synchronized (c) { c.onNext(ControlMsg.newBuilder().setLeader(leaderInfo()).build()); c.onCompleted(); } } catch (Exception ignored) {}
+        }
+        controls.clear();
+    }
+
     Policy setPolicy(Policy p) {
         Policy cur = policy.get();
         Policy next = p.toBuilder().setVersion(cur.getVersion() + 1).build();
-        policy.set(next);
+        installPolicy(next);
         replQueue.offer(BucketUpdate.newBuilder().setPolicy(next).build());
         Log.info("policy v%d: consistency=%s outage=%s key=%s/%s", next.getVersion(), next.getConsistency(), next.getOutageMode(), next.getKey().getCap(), next.getKey().getRate());
         pushControl();
@@ -284,23 +338,35 @@ public final class CoordNode {
 
     // ------------------------------------------------------------ gRPC transport for the Bully algorithm
     final class GrpcTransport implements BullyElection.Transport {
-        private ReplicationGrpc.ReplicationBlockingStub stub(int to) {
-            return ReplicationGrpc.newBlockingStub(channel(to)).withDeadlineAfter(300, TimeUnit.MILLISECONDS);
+        /**
+         * One election RPC, retried once on UNAVAILABLE after resetting the channel's reconnect
+         * backoff: a replica that just restarted would otherwise look dead for up to a second,
+         * and a lower id would wrongly win against it.
+         */
+        private <T> T call(int to, java.util.function.Function<ReplicationGrpc.ReplicationBlockingStub, T> rpc) {
+            for (int attempt = 0; ; attempt++) {
+                try { return rpc.apply(ReplicationGrpc.newBlockingStub(channel(to)).withDeadlineAfter(500, TimeUnit.MILLISECONDS)); }
+                catch (StatusRuntimeException e) {
+                    if (attempt > 0 || e.getStatus().getCode() != Status.Code.UNAVAILABLE) throw e;
+                    channel(to).resetConnectBackoff();
+                }
+            }
         }
+        private ElectionMsg msg(int from, long term) { return ElectionMsg.newBuilder().setFrom(from).setTerm(term).build(); }
         public boolean election(int to, int from, long term) {
-            try { return stub(to).election(ElectionMsg.newBuilder().setFrom(from).setTerm(term).build()).getOk(); }
+            try { return call(to, s -> s.election(msg(from, term))).getOk(); }
             catch (StatusRuntimeException e) { return false; }
         }
         public void coordinator(int to, int from, long term) {
-            try { stub(to).coordinator(ElectionMsg.newBuilder().setFrom(from).setTerm(term).build()); }
+            try { call(to, s -> s.coordinator(msg(from, term))); }
             catch (StatusRuntimeException ignored) {}
         }
         public boolean heartbeat(int to, int from, long term) {
-            try { return stub(to).heartbeat(ElectionMsg.newBuilder().setFrom(from).setTerm(term).build()).getOk(); }
+            try { return call(to, s -> s.heartbeat(msg(from, term))).getOk(); }
             catch (StatusRuntimeException e) { return false; }
         }
         public long termOf(int to) {
-            try { return stub(to).heartbeat(ElectionMsg.newBuilder().setFrom(id).setTerm(0).build()).getTerm(); }
+            try { return call(to, s -> s.heartbeat(msg(id, 0))).getTerm(); }
             catch (StatusRuntimeException e) { return -1; }
         }
     }

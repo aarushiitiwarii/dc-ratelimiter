@@ -1,5 +1,6 @@
 package com.rateguard.dc.edge;
 
+import com.rateguard.dc.common.Log;
 import com.rateguard.dc.common.Ports;
 import com.rateguard.dc.proto.Empty;
 import com.rateguard.dc.proto.PeerGrpc;
@@ -15,6 +16,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
@@ -34,16 +36,26 @@ public final class PeerNet {
     /** How messages reach another node (gRPC in production, in-memory in tests). */
     public interface Wire { void send(String to, PeerMsg m); }
 
-    private static final StreamObserver<Empty> NOOP = new StreamObserver<>() {
-        public void onNext(Empty e) {} public void onError(Throwable t) {} public void onCompleted() {}
-    };
+    public final AtomicLong failed = new AtomicLong();
+
+    /** Delivery result: a failed send is counted and logged (rate-limited), never retried. */
+    private StreamObserver<Empty> ack(String to, PeerMsg m) {
+        return new StreamObserver<>() {
+            public void onNext(Empty e) {}
+            public void onCompleted() {}
+            public void onError(Throwable t) {
+                if (failed.incrementAndGet() % 50 == 1) Log.info("peer send to %s failed (%s): %s", to, m.getBodyCase(), t.getMessage());
+            }
+        };
+    }
 
     public PeerNet(String self) { this(self, null); }
 
     public PeerNet(String self, Wire wire) {
         this.self = self;
         this.members = List.of(self);
-        this.wire = wire != null ? wire : (to, m) -> stub(to).deliver(m, NOOP);
+        this.wire = wire != null ? wire : (to, m) -> io.grpc.Context.ROOT.run(() ->         // not the inbound call's context: it is cancelled when that handler returns
+                stub(to).withDeadlineAfter(2, TimeUnit.SECONDS).deliver(m, ack(to, m)));
     }
 
     public void onMessage(Consumer<PeerMsg> h) { handler = h; }

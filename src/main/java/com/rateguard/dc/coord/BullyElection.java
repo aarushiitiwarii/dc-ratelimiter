@@ -71,7 +71,14 @@ public final class BullyElection {
     /** One failure-detector step (public for tests). */
     public void tick() {
         int l = leader;
-        if (l == id) return;
+        if (l == id) {
+            // a leader that can reach a higher id (e.g. after a missed announcement) hands over: Bully order wins
+            for (int h = id + 1; h <= n; h++) {
+                messages.incrementAndGet();
+                if (t.termOf(h) >= 0) { Log.info("coord-%d is alive above this leader -> election", h); setLeader(0, term); triggerElection(); return; }
+            }
+            return;
+        }
         if (l == 0) { triggerElection(); return; }
         messages.incrementAndGet();
         if (t.heartbeat(l, id, term)) { missed = 0; return; }

@@ -69,7 +69,7 @@ public final class LeaderClient implements Limiter.Leader {
                 rpcCalls.incrementAndGet();
                 LeaderInfo li = TokenStoreGrpc.newBlockingStub(channel(i)).withDeadlineAfter(150, TimeUnit.MILLISECONDS).whoIsLeader(Empty.getDefaultInstance());
                 if (li.getLeaderId() != 0) { leader = li.getLeaderId(); return leader; }
-            } catch (StatusRuntimeException ignored) {}
+            } catch (StatusRuntimeException e) { channel(i).resetConnectBackoff(); }   // so a restarted coordinator is seen at once
         }
         lastDiscoveryFail = System.currentTimeMillis();
         throw new NoLeader();
@@ -163,13 +163,13 @@ public final class LeaderClient implements Limiter.Leader {
                 StreamObserver<EdgeHello> up = TokenStoreGrpc.newStub(channel(l)).control(new StreamObserver<>() {
                     public void onNext(ControlMsg m) {
                         controlMsgs.incrementAndGet();
-                        if (m.hasLeader() && m.getLeader().getLeaderId() != 0) leader = m.getLeader().getLeaderId();
+                        if (m.hasLeader()) leader = m.getLeader().getLeaderId();   // 0 = demoted and no successor known yet: rediscover
                         if (m.hasPolicy()) onControl.accept(m);
                     }
                     public void onError(Throwable t) { closed.countDown(); }
                     public void onCompleted() { closed.countDown(); }
                 });
-                while (closed.getCount() > 0) {
+                while (closed.getCount() > 0 && leader == l) {       // follow the leader: reconnect when it changes
                     up.onNext(EdgeHello.newBuilder().setNode(node).setPeerAddr(peerAddr)
                             .setAllowed(allowedCount.getAsLong()).setDenied(deniedCount.getAsLong()).build());
                     if (closed.await(1, TimeUnit.SECONDS)) break;

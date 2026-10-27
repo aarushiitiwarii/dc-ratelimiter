@@ -107,7 +107,7 @@ message PeerMsg {
   }
 }
 message RaRequest { int64 clock = 1; }
-message RaReply { SharedBucket bucket = 1; }
+message RaReply { SharedBucket bucket = 1; int64 clock = 2; }   // clock echoes the request being answered
 message SkRequest { int64 seq = 1; }
 message SkToken { repeated int64 ln = 1; repeated string queue = 2; SharedBucket bucket = 3; repeated string order = 4; }
 message LockRequest { int64 txn = 1; int64 started = 2; }

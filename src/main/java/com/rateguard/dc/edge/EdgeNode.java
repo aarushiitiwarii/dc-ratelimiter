@@ -148,8 +148,7 @@ public final class EdgeNode {
                 reply(ex, 429, "too many requests\n");
                 return;
             }
-            ex.getRequestHeaders().set("X-Tenant-ID", c.tenant());
-            int u = 1 + Math.floorMod(upstreamRr.getAndIncrement(), 3);
+            int u =1 + Math.floorMod(upstreamRr.getAndIncrement(), 3);
             HttpResponse<String> r = http.send(HttpRequest.newBuilder(URI.create("http://" + Ports.HOST + ":" + Ports.upstream(u) + "/"))
                     .timeout(Duration.ofSeconds(2)).header("X-Tenant-ID", c.tenant()).GET().build(), HttpResponse.BodyHandlers.ofString());
             reply(ex, r.statusCode(), r.body());

@@ -1,19 +1,21 @@
 package com.rateguard.dc.edge;
 
+import com.rateguard.dc.common.Log;
 import com.rateguard.dc.proto.Limit;
 import com.rateguard.dc.proto.PeerMsg;
 import com.rateguard.dc.proto.RaReply;
 import com.rateguard.dc.proto.RaRequest;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -28,20 +30,23 @@ import java.util.concurrent.locks.ReentrantLock;
  * A node receiving REQUEST replies at once unless it is itself requesting with a
  * smaller (ts, id); then it defers the reply until it leaves the critical section.
  * Replies carry the sender's bucket replica, so the next holder always sees the
- * newest state. Messages per critical section: 2(N-1).
+ * newest state, and echo the request's timestamp so a late reply to an abandoned
+ * request is not counted for the next one. Messages per critical section: 2(N-1).
  */
 public final class RicartAgrawala implements Limiter.Outage {
     private final PeerNet net;
     private long clock;                                  // Lamport clock (guarded by this)
     private final Map<String, Res> res = new ConcurrentHashMap<>();
-    public final AtomicLong csEntries = new AtomicLong(), messages = new AtomicLong();
+    public final AtomicLong csEntries = new AtomicLong(), messages = new AtomicLong(), timeouts = new AtomicLong();
 
     private static final class Res {
         final ReentrantLock local = new ReentrantLock();     // one local requester at a time
+        final ReentrantLock mu = new ReentrantLock();        // guards the fields below (no synchronized: it pins virtual threads)
+        final Condition replied = mu.newCondition();
         final PeerNet.Shared bucket = new PeerNet.Shared();
-        final Set<String> deferred = new HashSet<>();
+        final Map<String, Long> deferred = new HashMap<>();  // peer -> timestamp of its deferred request
+        final Set<String> waiting = new HashSet<>();         // peers whose REPLY is still missing
         boolean requesting; long myTs;
-        CountDownLatch replies = new CountDownLatch(0);
     }
 
     public RicartAgrawala(PeerNet net) { this.net = net; }
@@ -55,19 +60,25 @@ public final class RicartAgrawala implements Limiter.Outage {
             List<String> others = net.others();
             long ts;
             synchronized (this) { ts = ++clock; }
-            synchronized (r) { r.requesting = true; r.myTs = ts; r.replies = new CountDownLatch(others.size()); }
+            r.mu.lock(); try { r.requesting = true; r.myTs = ts; r.waiting.clear(); r.waiting.addAll(others); } finally { r.mu.unlock(); }
             for (String o : others) send(o, PeerMsg.newBuilder().setResource(resource).setRaRequest(RaRequest.newBuilder().setClock(ts)));
             boolean all;
-            try { all = r.replies.await(2, TimeUnit.SECONDS); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); all = false; }
+            r.mu.lock(); try {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                try {
+                    while (!r.waiting.isEmpty() && System.nanoTime() < deadline) r.replied.awaitNanos(deadline - System.nanoTime());
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                all = r.waiting.isEmpty();
+                if (!all && timeouts.incrementAndGet() % 20 == 1) Log.info("RA %s: no reply from %s within 2 s", resource, r.waiting);
+            } finally { r.mu.unlock(); }
             long granted = 0;
             if (all) {
-                synchronized (r) { granted = r.bucket.take(lim, want, System.currentTimeMillis()); }   // critical section
+                r.mu.lock(); try { granted = r.bucket.take(lim, want, System.currentTimeMillis()); } finally { r.mu.unlock(); }   // critical section
                 csEntries.incrementAndGet();
             }
-            List<String> def;
-            synchronized (r) { r.requesting = false; def = new ArrayList<>(r.deferred); r.deferred.clear(); }
-            for (String d : def) reply(d, resource, r);
+            Map<String, Long> def;
+            r.mu.lock(); try { r.requesting = false; r.waiting.clear(); def = new HashMap<>(r.deferred); r.deferred.clear(); } finally { r.mu.unlock(); }
+            def.forEach((d, dts) -> reply(d, resource, dts, r));
             if (!all) throw new LeaderClient.NoLeader();       // a peer did not answer: give up this round
             return granted;
         } finally { r.local.unlock(); }
@@ -75,9 +86,9 @@ public final class RicartAgrawala implements Limiter.Outage {
 
     private void send(String to, PeerMsg.Builder m) { messages.incrementAndGet(); net.send(to, m); }
 
-    private void reply(String to, String resource, Res r) {
+    private void reply(String to, String resource, long reqTs, Res r) {
         PeerMsg.Builder m;
-        synchronized (r) { m = PeerMsg.newBuilder().setResource(resource).setRaReply(RaReply.newBuilder().setBucket(r.bucket.proto())); }
+        r.mu.lock(); try { m = PeerMsg.newBuilder().setResource(resource).setRaReply(RaReply.newBuilder().setBucket(r.bucket.proto()).setClock(reqTs)); } finally { r.mu.unlock(); }
         send(to, m);
     }
 
@@ -88,15 +99,17 @@ public final class RicartAgrawala implements Limiter.Outage {
             long ts = m.getRaRequest().getClock();
             boolean defer;
             synchronized (this) { clock = Math.max(clock, ts) + 1; }
-            synchronized (r) {
+            r.mu.lock(); try {
                 // defer when our own pending request has priority: (myTs, self) < (ts, from)
                 defer = r.requesting && (r.myTs < ts || (r.myTs == ts && PeerNet.idOf(net.self) < PeerNet.idOf(m.getFrom())));
-                if (defer) r.deferred.add(m.getFrom());
-            }
-            if (!defer) reply(m.getFrom(), m.getResource(), r);
+                if (defer) r.deferred.put(m.getFrom(), ts);
+            } finally { r.mu.unlock(); }
+            if (!defer) reply(m.getFrom(), m.getResource(), ts, r);
         } else if (m.hasRaReply()) {
-            synchronized (r) { r.bucket.adoptIfNewer(m.getRaReply().getBucket()); }
-            r.replies.countDown();
+            r.mu.lock(); try {
+                r.bucket.adoptIfNewer(m.getRaReply().getBucket());
+                if (r.requesting && m.getRaReply().getClock() == r.myTs && r.waiting.remove(m.getFrom())) r.replied.signalAll();
+            } finally { r.mu.unlock(); }
         }
     }
 }
