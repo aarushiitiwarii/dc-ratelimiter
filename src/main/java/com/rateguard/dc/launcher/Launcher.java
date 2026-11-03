@@ -76,6 +76,8 @@ public final class Launcher implements ClusterControl {
         define("lb", "lb", Ports.LB, "--strategy=rr");
         define("console", "console", Ports.CONSOLE, "--secret=" + secret);
 
+        // stubs carry this address; without it RMI embeds the LAN IP, and calls hang once the network changes
+        System.setProperty("java.rmi.server.hostname", Ports.HOST);
         Registry reg = LocateRegistry.createRegistry(Ports.RMI_REGISTRY);
         reg.rebind(NAME, UnicastRemoteObject.exportObject(this, 0));
         Log.info("RMI registry on :%d, ClusterControl bound as '%s'", Ports.RMI_REGISTRY, NAME);
